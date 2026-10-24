@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+mr-ci — track a GitLab MR's CI pipeline (and comments) live in your terminal.
+
+Works with any GitLab instance (self-hosted or gitlab.com). No credentials are
+stored anywhere: the access token is read from the GITLAB_TOKEN environment
+variable or the --token flag at run time.
+
+Usage:
+  mr-ci 123                  # live-track MR !123 until it reaches a final state
+  mr-ci 123 --once           # single snapshot, then exit
+  mr-ci 123 --watch          # keep running after CI finishes to keep watching comments
+  mr-ci feature/branch       # track by source branch (uses the newest open MR)
+  mr-ci 123 --interval 15    # poll every 15s (default 30)
+  mr-ci 123 --plain          # don't clear the screen between polls (log-friendly)
+  mr-ci 123 --reply "lgtm" --to latest    # reply to the most recent comment
+  mr-ci 123 --reply "thanks" --to 4567    # reply to a specific note id
+  mr-ci 123 --reply "top-level note"      # post a top-level comment (no --to)
+  mr-ci 123 --reply "msg" --to latest --dry-run   # preview without posting
+
+Configuration (no file, no stored secrets):
+  token      GITLAB_TOKEN env var   or  --token
+  instance   GITLAB_INSTANCE env    or  --instance   (default https://gitlab.com)
+  project    GITLAB_PROJECT env     or  --project    (required)
+
+Comments: while tracking, the latest MR comment is always shown, and new
+(non-system, not-authored-by-you) comments appear highlighted in a
+"NEW this session" section. --watch keeps the dashboard alive after the
+pipeline finishes so you keep getting comment alerts (Ctrl-C to stop).
+
+Reply: --reply posts a comment and exits. --to <note_id> (or 'latest') threads
+it into that comment's discussion; omit --to for a new top-level comment. Add
+--dry-run to print the request without posting.
+
+Exit codes: 0 = pipeline succeeded (or --once/--help), 1 = failed/canceled,
+130 = interrupted, 2 = usage/config error.
+"""
+import argparse
+import json
+import os
+import ssl
+import sys
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+TERMINAL = {"success", "failed", "canceled", "skipped", "manual"}
+INPROG = {"running", "preparing"}
+QUEUED = {"created", "pending", "waiting_for_resource", "scheduled"}
+DEFAULT_INSTANCE = "https://gitlab.com"
+
+# status -> (4-char tag, ANSI color)
+TAG = {
+    "success":  (" OK ", "\033[32m"),
+    "running":  (" RUN", "\033[36m"),
+    "preparing": ("PREP", "\033[36m"),
+    "pending":  (" QUE", "\033[33m"),
+    "created":  (" QUE", "\033[33m"),
+    "waiting_for_resource": ("QUE", "\033[33m"),
+    "scheduled": (" QUE", "\033[33m"),
+    "failed":   ("FAIL", "\033[31m"),
+    "canceled": ("CANC", "\033[31m"),
+    "skipped":  ("SKIP", "\033[90m"),
+    "manual":   ("MAN ", "\033[35m"),
+}
+PIPE_SYM = {
+    "success": "OK  ", "failed": "FAIL", "canceled": "CANC", "running": "RUN ",
+    "manual": "MAN ", "skipped": "SKIP",
+}
+
+
+def fail(msg, code=2):
+    sys.stderr.write("error: %s\n" % msg)
+    sys.exit(code)
+
+
+def api(base, path, token):
+    url = base.rstrip("/") + path
+    ctx = ssl._create_unverified_context()
+    req = urllib.request.Request(
+        url, headers={"PRIVATE-TOKEN": token, "Accept": "application/json"}
+    )
+    with urllib.request.urlopen(req, context=ctx, timeout=30) as r:
+        return json.load(r)
+
+
+def api_post(base, path, token, payload):
+    url = base.rstrip("/") + path
+    ctx = ssl._create_unverified_context()
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={"PRIVATE-TOKEN": token, "Content-Type": "application/json",
+                 "Accept": "application/json"})
+    with urllib.request.urlopen(req, context=ctx, timeout=30) as r:
+        return json.load(r)
+
+
+def parse_ts(s):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def fmt_dt(s):
+    d = parse_ts(s)
+    return d.strftime("%H:%M:%SZ") if d else "-"
+
+
+def fmt_dur(a, b):
+    A, B = parse_ts(a), parse_ts(b)
+    if not A or not B:
+        return ""
+    secs = max(0, int((B - A).total_seconds()))
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    return ("%d:%02d:%02d" % (h, m, s)) if h else ("%02d:%02d" % (m, s))
+
+
+def color(text, code):
+    return "\033[0m" + code + text + "\033[0m"
+
+
+def tag_for(status):
+    t, c = TAG.get(status, (" ??", "\033[90m"))
+    return color("[ %s ]" % t, c)
+
+
+def snippet(body, n=72):
+    body = (body or "").replace("\r", " ").strip()
+    for line in body.splitlines():
+        line = line.strip()
+        if line:
+            body = line
+            break
+    body = body.replace("\n", " ")
+    if len(body) > n:
+        body = body[: n - 1] + "…"
+    return body
+
+
+def render(mr, pipeline, jobs, now, poll, plain, pweb, last_note=None, new_notes=None):
+    if not plain:
+        sys.stdout.write("\033[2J\033[H")
+    out = []
+    iid = mr.get("iid")
+    title = (mr.get("title") or "").strip()
+    if iid is not None:
+        out.append(" MR !%s  %s" % (iid, title))
+    else:
+        out.append(" branch: %s" % (mr.get("source_branch") or mr.get("title")))
+    out.append("   %s   %s -> %s" % (
+        mr.get("state", "?"), mr.get("source_branch", "?"), mr.get("target_branch", "?")))
+    if pipeline:
+        out.append("   head %s   pipeline #%s   poll #%d" % (
+            (mr.get("sha") or "?")[:10], pipeline.get("iid") or pipeline.get("id"), poll))
+    else:
+        out.append("   head %s   (no pipeline yet)" % ((mr.get("sha") or "?")[:10]))
+    out.append("")
+
+    if pipeline:
+        pstat = pipeline.get("status", "?")
+        sym = PIPE_SYM.get(pstat, pstat.upper()[:4])
+        started = pipeline.get("created_at")
+        out.append(" status: [%s] %s   since %s   elapsed %s" % (
+            color(sym, "\033[1m"), pstat.upper(), fmt_dt(started),
+            fmt_dur(started, now.isoformat())))
+    else:
+        out.append(" status: WAITING for a pipeline to start...")
+
+    # job counts
+    done = sum(1 for j in jobs if j["status"] in ("success", "failed", "canceled", "skipped"))
+    run = sum(1 for j in jobs if j["status"] in INPROG)
+    que = sum(1 for j in jobs if j["status"] in QUEUED)
+    man = sum(1 for j in jobs if j["status"] == "manual")
+    bits = ["%d/%d done" % (done, len(jobs))]
+    if run: bits.append("%d running" % run)
+    if que: bits.append("%d queued" % que)
+    if man: bits.append("%d manual" % man)
+    out.append(" jobs:   " + "  ·  ".join(bits))
+    out.append("")
+
+    # stable stage ordering (order of first appearance)
+    seq = []
+    for j in jobs:
+        s = j.get("stage", "")
+        if s not in seq:
+            seq.append(s)
+    rank = {s: i for i, s in enumerate(seq)}
+    jobs_sorted = sorted(
+        jobs,
+        key=lambda j: (rank.get(j.get("stage", ""), 99), j.get("started_at") or "9999"),
+    )
+    for j in jobs_sorted:
+        st = j["status"]
+        stage = (j.get("stage") or "")[:18]
+        name = (j.get("name") or "")[:36]
+        if st in INPROG:
+            dur = color(fmt_dur(j.get("started_at"), now.isoformat()), "\033[36m") + " (run)"
+        elif st == "success" or st in ("failed", "canceled"):
+            dur = fmt_dur(j.get("started_at"), j.get("finished_at"))
+        else:
+            dur = ""
+        out.append("  %s %s  %s  %s" % (tag_for(st), stage.ljust(18), name.ljust(36), dur))
+
+    # MR comments
+    if mr.get("iid") is not None:
+        out.append("")
+        if last_note:
+            auth = (last_note.get("author") or {}).get("username") or "?"
+            out.append(" 💬 latest comment:  %s  @ %s" % (auth, fmt_dt(last_note.get("created_at"))))
+            sn = snippet(last_note.get("body"))
+            if sn:
+                out.append("    %s" % sn)
+        else:
+            out.append(" 💬 no comments yet")
+        if new_notes:
+            out.append("   %s" % color("NEW this session (%d):" % len(new_notes), "\033[33m"))
+            for nn in new_notes[-6:]:
+                auth = (nn.get("author") or {}).get("username") or "?"
+                out.append("     %s @ %s  %s" % (auth, fmt_dt(nn.get("created_at")), snippet(nn.get("body"), 56)))
+                out.append("       %s/-/merge_requests/%s#note_%s" % (pweb, mr.get("iid"), nn.get("id")))
+
+    out.append("")
+    out.append(color("-" * 66, "\033[90m"))
+    out.append(" updated: %s" % now.strftime("%H:%M:%SZ"))
+    sys.stdout.write("\n".join(out) + "\n")
+    sys.stdout.flush()
+
+
+def final_banner(pipeline, jobs, pweb):
+    pstat = pipeline.get("status", "?")
+    pid = pipeline.get("id")
+    out = []
+    out.append(color("-" * 66, "\033[90m"))
+    total = fmt_dur(pipeline.get("created_at"), pipeline.get("updated_at"))
+    if pstat == "success":
+        out.append(color("  RESULT: SUCCESS  (pipeline #%s, %d jobs, %s)" % (
+            pipeline.get("iid") or pid, len(jobs), total), "\033[32m"))
+    elif pstat == "failed":
+        out.append(color("  RESULT: FAILED  (pipeline #%s)" % (pipeline.get("iid") or pid), "\033[31m"))
+        for j in jobs:
+            if j["status"] == "failed":
+                out.append("    %s %s  %s" % (
+                    tag_for("failed"), (j.get("stage") or "")[:18], j.get("name")))
+                out.append("       trace: %s/-/jobs/%s" % (pweb, j["id"]))
+    else:
+        out.append("  RESULT: %s  (pipeline #%s)" % (pstat.upper(), pipeline.get("iid") or pid))
+    sys.stdout.write("\n".join(out) + "\n")
+    sys.stdout.flush()
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Live-track a GitLab MR's CI pipeline and comments in the terminal.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="examples:\n"
+               "  mr-ci 123\n"
+               "  mr-ci 123 --once\n"
+               "  mr-ci 123 --watch\n"
+               "  mr-ci feature/branch --interval 15\n"
+               "  mr-ci 123 --reply \"lgtm\" --to latest\n",
+    )
+    ap.add_argument("ref", help="MR IID (e.g. 123) or source branch name")
+    ap.add_argument("-p", "--project", help="project id or 'group/name' (default: $GITLAB_PROJECT)")
+    ap.add_argument("-i", "--instance", help="GitLab instance URL (default: $GITLAB_INSTANCE or https://gitlab.com)")
+    ap.add_argument("-t", "--token", help="GitLab access token (default: $GITLAB_TOKEN)")
+    ap.add_argument("--interval", type=int, default=30, help="poll interval seconds (default 30)")
+    ap.add_argument("--once", action="store_true", help="print one snapshot and exit")
+    ap.add_argument("--plain", action="store_true", help="no screen clearing (append mode)")
+    ap.add_argument("--watch", action="store_true",
+                    help="keep running after the pipeline finishes (keep watching for new comments)")
+    ap.add_argument("--reply", metavar="MESSAGE",
+                    help="post MESSAGE as an MR comment, then exit (threaded if --to given, else top-level)")
+    ap.add_argument("--to", metavar="NOTE_ID",
+                    help="with --reply: note id to reply to, or 'latest' for the most recent comment")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="with --reply: print the request instead of posting")
+    args = ap.parse_args()
+
+    token = args.token or os.environ.get("GITLAB_TOKEN")
+    instance = args.instance or os.environ.get("GITLAB_INSTANCE") or DEFAULT_INSTANCE
+    project = args.project or os.environ.get("GITLAB_PROJECT")
+    if not token:
+        fail("no token (set GITLAB_TOKEN or pass --token)")
+    if not project:
+        fail("no project (set GITLAB_PROJECT or pass --project)")
+    # accept 'group/name' or numeric id
+    project_path = project.strip()
+
+    # resolve the project to get its numeric id + web url (for trace links)
+    pweb = instance + "/" + urllib.parse.quote(project_path, safe="/")
+    proj_id = project_path
+    try:
+        pmeta = api(instance, "/api/v4/projects/%s" % urllib.parse.quote(project_path, safe=""), token)
+        proj_id = pmeta.get("id", proj_id)
+        ppath = pmeta.get("path_with_namespace", project_path)
+        pweb = pmeta.get("web_url") or (instance + "/" + urllib.parse.quote(ppath, safe="/"))
+    except urllib.error.HTTPError:
+        # numeric id may not resolve via the encoded path; try as-is
+        if not project_path.isdigit():
+            fail("project %r not found (check id / 'group/name' and token access)" % project_path)
+
+    # who am I (to suppress notifications for my own comments)
+    my_id = None
+    try:
+        me = api(instance, "/user", token)
+        my_id = me.get("id")
+    except Exception:
+        my_id = None
+
+    is_mr = str(args.ref).isdigit()
+
+    def resolve_mr():
+        if is_mr:
+            return api(instance, "/api/v4/projects/%s/merge_requests/%s" % (proj_id, args.ref), token)
+        q = urllib.parse.quote(args.ref, safe="")
+        mrs = api(instance, "/api/v4/projects/%s/merge_requests?state=opened&source_branch=%s"
+                  "&per_page=20&order_by=updated_at&sort=desc" % (proj_id, q), token)
+        return mrs[0] if mrs else None
+
+    def resolve_pipeline(head_sha):
+        q = urllib.parse.quote(head_sha, safe="")
+        pl = api(instance, "/api/v4/projects/%s/pipelines?sha=%s&per_page=30" % (proj_id, q), token)
+        return max(pl, key=lambda p: p["id"]) if pl else None
+
+    def latest_pipeline_on_branch():
+        q = urllib.parse.quote(args.ref, safe="")
+        pl = api(instance, "/api/v4/projects/%s/pipelines?ref=%s&per_page=30" % (proj_id, q), token)
+        return max(pl, key=lambda p: p["id"]) if pl else None
+
+    def fetch_jobs(pid):
+        return api(instance, "/api/v4/projects/%s/pipelines/%s/jobs?per_page=100" % (proj_id, pid), token)
+
+    def fetch_notes(mr_iid):
+        return api(instance, "/api/v4/projects/%s/merge_requests/%s/notes?sort=desc&per_page=50"
+                   % (proj_id, mr_iid), token)
+
+    def find_discussion_for_note(mr_iid, note_id):
+        """Look a thread id up via the discussions endpoint (match by note id);
+        some instances don't populate note['discussion_id'] in the notes list."""
+        page = 1
+        while page <= 5:
+            discs = api(instance,
+                        "/api/v4/projects/%s/merge_requests/%s/discussions?per_page=100&page=%d"
+                        % (proj_id, mr_iid, page), token)
+            if not discs:
+                return None
+            for d in discs:
+                for n in d.get("notes", []):
+                    if n.get("id") == note_id:
+                        return d.get("id")
+            if len(discs) < 100:
+                return None
+            page += 1
+        return None
+
+    # ---- one-shot reply (post a comment, then exit) ----
+    if args.reply is not None:
+        try:
+            mr = resolve_mr()
+            if mr is None or mr.get("iid") is None:
+                fail("could not find an open MR for %r to reply to" % args.ref)
+            iid = mr["iid"]
+            discussion_id = None
+            if args.to:
+                if args.to.lower() == "latest":
+                    notes = fetch_notes(iid)
+                    human = [n for n in notes if not n.get("system")]
+                    human.sort(key=lambda n: n.get("id", 0))
+                    if not human:
+                        fail("no existing comments to reply to")
+                    target_note_id = human[-1].get("id")
+                else:
+                    target_note_id = int(args.to)
+                discussion_id = find_discussion_for_note(iid, target_note_id)
+                if discussion_id is None:
+                    print("  warning: could not find the discussion for note %s; posting top-level"
+                          % target_note_id)
+            # Threaded replies go to the *discussions* endpoint; top-level -> /notes.
+            if args.dry_run:
+                if discussion_id:
+                    print("  DRY-RUN  POST %s/api/v4/projects/%s/merge_requests/%s/discussions/%s/notes"
+                          % (instance, proj_id, iid, discussion_id))
+                else:
+                    print("  DRY-RUN  POST %s/api/v4/projects/%s/merge_requests/%s/notes  (top-level)"
+                          % (instance, proj_id, iid))
+                print("  body: %s" % json.dumps({"body": args.reply}, indent=2))
+                return 0
+            if discussion_id:
+                created = api_post(instance,
+                    "/api/v4/projects/%s/merge_requests/%s/discussions/%s/notes"
+                    % (proj_id, iid, discussion_id), token, {"body": args.reply})
+            else:
+                created = api_post(instance,
+                    "/api/v4/projects/%s/merge_requests/%s/notes" % (proj_id, iid),
+                    token, {"body": args.reply})
+            print("  posted note #%s  %s" % (created.get("id"),
+                  "(threaded reply)" if discussion_id else "(top-level comment)"))
+            print("  url: %s/-/merge_requests/%s#note_%s" % (pweb, iid, created.get("id")))
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8", "replace")[:200]
+            except Exception:
+                pass
+            fail("request failed: HTTP %s %s %s" % (e.code, e.reason, body))
+        except SystemExit:
+            raise
+        except Exception as e:
+            fail("%s" % e)
+        return 0
+
+    state = {"seeded": False, "seen_note_ids": set(), "new_notes": [], "last_note": None,
+             "final_shown": False}
+    poll = 0
+    try:
+        while True:
+            poll += 1
+            now = datetime.now(timezone.utc)
+            try:
+                mr = resolve_mr()
+                if mr is None:
+                    mr = {"title": "branch %s" % args.ref, "state": "(no open MR)",
+                          "sha": None, "source_branch": args.ref, "target_branch": "?"}
+                    pipeline = latest_pipeline_on_branch()
+                else:
+                    pipeline = resolve_pipeline(mr.get("sha")) if mr.get("sha") else None
+                jobs = fetch_jobs(pipeline["id"]) if pipeline else []
+            except urllib.error.HTTPError as e:
+                body = ""
+                try:
+                    body = e.read().decode("utf-8", "replace")[:200]
+                except Exception:
+                    pass
+                print("HTTP %s: %s" % (e.code, body))
+                if args.once:
+                    return 1
+                time.sleep(args.interval)
+                continue
+            except Exception as e:
+                print("API/network error: %s" % e)
+                if args.once:
+                    return 1
+                time.sleep(args.interval)
+                continue
+
+            # MR comments (only when we have an MR to attach them to)
+            if mr.get("iid") is not None:
+                try:
+                    notes = fetch_notes(mr["iid"])
+                    human = [n for n in notes if not n.get("system")]
+                    human.sort(key=lambda n: n.get("id", 0))
+                    if human:
+                        state["last_note"] = human[-1]
+                    if not state["seeded"]:
+                        state["seen_note_ids"] = {n.get("id") for n in human}
+                        state["seeded"] = True
+                    else:
+                        for n in human:
+                            nid = n.get("id")
+                            if nid not in state["seen_note_ids"]:
+                                state["seen_note_ids"].add(nid)
+                                if (n.get("author") or {}).get("id") != my_id:
+                                    state["new_notes"].append(n)
+                except Exception:
+                    pass
+
+            render(mr, pipeline, jobs, now, poll, args.plain or args.once, pweb,
+                   state["last_note"], state["new_notes"])
+
+            if args.once:
+                if pipeline and pipeline.get("status") in TERMINAL:
+                    final_banner(pipeline, jobs, pweb)
+                return 0
+
+            status = pipeline.get("status") if pipeline else "waiting"
+            if status in TERMINAL:
+                if not state["final_shown"]:
+                    final_banner(pipeline, jobs, pweb)
+                    state["final_shown"] = True
+                if not args.watch:
+                    return 0 if status == "success" else 1
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print("\ninterrupted")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

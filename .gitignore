@@ -1,0 +1,14 @@
+# never commit secrets or local state
+*.token
+.env
+config.json
+mr-ci.json
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# editor/OS noise
+*.swp
+.DS_Store
